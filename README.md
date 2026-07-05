@@ -1,6 +1,6 @@
 # Document Drawing — 文档绘图插件
 
-在思源笔记文档上实现多图层透明绘图，支持桌面端（Windows/macOS/Linux）和平板端（Android/iOS/鸿蒙）。
+在思源笔记文档上实现多图层透明绘图，支持桌面端（Windows/macOS/Linux）和平板端（Android/iOS/鸿蒙）。（下载文件放进'工作空间/data/plugins'文件目录下，移动端使用桌面端同步）
 
 ## 功能概览
 
