@@ -2658,51 +2658,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
         this._syncDocumentLayers();
         var self = this;  // ★ 必须在所有分支之前声明
 
-        // 移动端/平板端：用极简浮层（只两个按钮），避免完整弹窗崩溃
-        if (!IS_DESKTOP) {
-            this._autoSave();
-            try {
-                var m_layers = this._layerManager.getLayers();
-                var m_ids = [];
-                m_layers.forEach(function (l) { if (l.visible && l.canvas) m_ids.push(l.id); });
-                if (m_ids.length === 0) { siyuan.showMessage("⚠️ 没有可见图层可导出", 2000); return; }
-                var m_popup = document.createElement("div");
-                m_popup.style.cssText = "position:fixed;z-index:10002;background:#fff;border:1px solid #ddd;" +
-                    "border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.15);padding:8px 10px;" +
-                    "display:flex;gap:8px;left:50%;top:50%;transform:translate(-50%,-50%);";
-                m_popup.innerHTML =
-                    '<button id="dd-m-export-png" style="padding:6px 14px;font-size:13px;border:1px solid #1890ff;background:#1890ff;color:#fff;border-radius:5px;cursor:pointer;">🖼️ PNG</button>' +
-                    '<button id="dd-m-export-pdf" style="padding:6px 14px;font-size:13px;border:1px solid #ddd;background:#f5f5f5;border-radius:5px;cursor:pointer;">📄 PDF</button>';
-                document.body.appendChild(m_popup);
-                var m_close = function () { try { document.body.removeChild(m_popup); } catch (ex) {} };
-                m_popup.querySelector("#dd-m-export-png").addEventListener("click", function () {
-                    m_close();
-                    try {
-                        window._ddExportMsgId = siyuan.showMessage("📸 正在截图文档...", -1);
-                        if (!self._exportManager) { siyuan.showMessage("❌ ExportManager 不存在", 3000); return; }
-                        self._exportManager.exportPNG(m_ids);
-                    } catch (e) {
-                        siyuan.showMessage("❌ 导出异常：" + (e.message || e), 3000);
-                    }
-                });
-                m_popup.querySelector("#dd-m-export-pdf").addEventListener("click", function () {
-                    m_close();
-                    try {
-                        siyuan.showMessage("⏳ 正在导出 PDF...", 2000);
-                        self._exportPDF(m_ids);
-                    } catch (e) {
-                        siyuan.showMessage("❌ PDF异常：" + (e.message || e), 3000);
-                    }
-                });
-                setTimeout(function () {
-                    var h = function (ev) { if (!m_popup.contains(ev.target)) { m_close(); document.removeEventListener("click", h, true); } };
-                    document.addEventListener("click", h, true);
-                }, 300);
-            } catch (e) {
-                siyuan.showMessage("❌ 导出失败: " + (e.message || "未知错误"), 3000);
-            }
-            return;
-        }
+        this._autoSave();
 
         const editor = this._docManager ? this._docManager.getDocumentDOM() : null;
         if (!editor) { siyuan.showMessage("⚠️ 请先打开一个文档", 2000); return; }
@@ -2771,6 +2727,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
             var ids = getSelectedIds();
             closePopup();
             if (ids.length === 0) { siyuan.showMessage("⚠️ 请至少勾选一个图层", 2000); return; }
+            window._ddExportMsgId = siyuan.showMessage("📸 正在截图文档...", -1);
             self._exportPDF(ids);
         };
 
