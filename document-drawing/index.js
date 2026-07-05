@@ -1183,13 +1183,12 @@ class ExportManager {
         mctx.fillRect(0, 0, mc.width, mc.height);
         sel.forEach(function (l) { mctx.drawImage(l.canvas, 0, 0); });
 
-        // 尝试截文档背景（仅桌面端有 html2canvas 且 editor 存在时才做）
+        // 尝试截文档背景（桌面端和平板端都走 html2canvas）
         var editor = this._docManager ? this._docManager.getDocumentDOM() : null;
-        if (IS_DESKTOP && editor && this._html2canvasReady !== false) {
-            siyuan.showMessage("📸 正在截图文档...", 2000);
+        if (editor && this._html2canvasReady !== false) {
             this._ensureHtml2Canvas(function (h2c) {
                 if (h2c) {
-                    h2c(editor, { backgroundColor: "#ffffff", scale: 2, useCORS: true, logging: false }).then(function (docCanvas) {
+                    h2c(editor, { backgroundColor: "#ffffff", scale: 3, useCORS: true, logging: false }).then(function (docCanvas) {
                         var finalCanvas = document.createElement("canvas");
                         finalCanvas.width = docCanvas.width;
                         finalCanvas.height = docCanvas.height;
@@ -1214,7 +1213,7 @@ class ExportManager {
 
     _finishExport(canvas, docId) {
         var selfExport = this;
-        var maxDim = 1600;
+        var maxDim = 2800;
         if (canvas.width > maxDim || canvas.height > maxDim) {
             var scale = Math.min(maxDim / canvas.width, maxDim / canvas.height);
             var sc = document.createElement("canvas");
@@ -1269,6 +1268,7 @@ class ExportManager {
         _showPreview(null);
 
         function _showPreview(serverUrl) {
+            if (window._ddExportMsgId) { try { siyuan.hideMessage(window._ddExportMsgId); } catch(e) {} window._ddExportMsgId = null; }
             var overlay = document.createElement("div");
             overlay.style.cssText = "position:fixed;z-index:10010;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;";
             var buttonsHtml;
@@ -1398,7 +1398,7 @@ class ExportManager {
         } else {
             // 移动端：缩小后导出（避免大画布 toDataURL 内存溢出）
             try {
-                var maxDim = 1600;
+                var maxDim = 2800;
                 var w = canvas.width, h = canvas.height;
                 var exportCanvas = canvas;
                 if (w > maxDim || h > maxDim) {
@@ -2574,7 +2574,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
                 m_popup.querySelector("#dd-m-export-png").addEventListener("click", function () {
                     m_close();
                     try {
-                        siyuan.showMessage("⏳ 正在导出 PNG...", 2000);
+                        window._ddExportMsgId = siyuan.showMessage("📸 正在截图文档...", -1);
                         if (!self._exportManager) { siyuan.showMessage("❌ ExportManager 不存在", 3000); return; }
                         self._exportManager.exportPNG(m_ids);
                     } catch (e) {
@@ -2660,6 +2660,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
             var ids = getSelectedIds();
             closePopup();
             if (ids.length === 0) { siyuan.showMessage("⚠️ 请至少勾选一个图层", 2000); return; }
+            window._ddExportMsgId = siyuan.showMessage("📸 正在截图文档...", -1);
             if (self._exportManager) self._exportManager.exportPNG(ids);
         };
         popup.querySelector("#dd-export-pdf").onclick = function () {
@@ -2703,13 +2704,15 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
             selectedLayers.forEach(function (layer) { ctx.drawImage(layer.canvas, 0, 0); });
         };
 
-        // 平板端：构建 PDF blob 后用 fetchPost 上传→预览
+        // 平板端：尝试截文档 + 图层合并 → 构建 PDF → 上传预览
         if (!IS_DESKTOP && typeof _siyuanFetchPost === "function") {
             var mc = document.createElement("canvas");
             mergeLayers(mc);
             var docId = this._docManager ? this._docManager.getDocumentID() : "export";
-            var pdfBlob = self._buildPdfBlobFromCanvas(mc);
-            if (pdfBlob) {
+
+            var _uploadPdfBlob = function (finalCanvas) {
+                var pdfBlob = self._buildPdfBlobFromCanvas(finalCanvas);
+                if (!pdfBlob) { self._showExportPreview(null); return; }
                 var ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
                 var fn = "drawing-" + docId + "-" + ts + ".pdf";
                 var formData = new FormData();
@@ -2724,19 +2727,39 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
                         self._showExportPreview(null);
                     }
                 });
-            }
+            };
+
+            var editor = this._docManager ? this._docManager.getDocumentDOM() : null;
+            if (editor && this._exportManager) {
+                window._ddExportMsgId = siyuan.showMessage("📸 正在截图文档...", -1);
+                this._exportManager._ensureHtml2Canvas(function (h2c) {
+                    if (h2c) {
+                        h2c(editor, { backgroundColor: "#ffffff", scale: 3, useCORS: true, logging: false }).then(function (docCanvas) {
+                            var finalC = document.createElement("canvas");
+                            finalC.width = docCanvas.width; finalC.height = docCanvas.height;
+                            var fctx = finalC.getContext("2d");
+                            fctx.drawImage(docCanvas, 0, 0);
+                            var sx = docCanvas.width / mc.width, sy = docCanvas.height / mc.height;
+                            fctx.save(); fctx.scale(sx, sy);
+                            selectedLayers.forEach(function (l) { fctx.drawImage(l.canvas, 0, 0); });
+                            fctx.restore();
+                            _uploadPdfBlob(finalC);
+                        }).catch(function () { _uploadPdfBlob(mc); });
+                    } else { _uploadPdfBlob(mc); }
+                });
+            } else { _uploadPdfBlob(mc); }
             return;
         }
 
         // 桌面端：尝试截取文档内容（走 html2canvas）
-        var editor = this._docManager ? this._docManager.getDocumentDOM() : null;
-        if (IS_DESKTOP && editor && this._exportManager) {
+        var editor2 = this._docManager ? this._docManager.getDocumentDOM() : null;
+        if (editor2 && this._exportManager) {
             siyuan.showMessage("📸 正在截图文档内容...", 2000);
             this._exportManager._ensureHtml2Canvas(function (h2c) {
                 if (h2c) {
-                    h2c(editor, {
+                    h2c(editor2, {
                         backgroundColor: "#ffffff",
-                        scale: 2,
+                        scale: 3,
                         useCORS: true,
                         logging: false
                     }).then(function (docCanvas) {
@@ -2801,6 +2824,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
 
     // 导出预览弹窗（平板端和桌面端共用）
     _showExportPreview(serverUrl) {
+        if (window._ddExportMsgId) { try { siyuan.hideMessage(window._ddExportMsgId); } catch(e) {} window._ddExportMsgId = null; }
         var self = this;
         var overlay = document.createElement("div");
         overlay.style.cssText = "position:fixed;z-index:10010;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;";
