@@ -228,6 +228,27 @@ class DocumentManager {
         return this._docRect || { left: 0, top: 0, width: 800, height: 600 };
     }
     getEditorElement() { return this.getDocumentDOM(); }
+    getDocumentTitle() {
+        // 尝试多种方式获取文档标题
+        try {
+            // 方式1：思源 API
+            if (window.siyuan && window.siyuan.editor && window.siyuan.editor.protyle) {
+                var t = window.siyuan.editor.protyle.block?.title || window.siyuan.editor.protyle.title;
+                if (t) return t;
+            }
+            // 方式2：从编辑器 DOM 找标题元素
+            var editor = this.getDocumentDOM();
+            if (editor) {
+                var titleEl = editor.closest(".protyle")?.querySelector(".protyle-title__input")
+                    || editor.closest('[data-node-id]')?.querySelector(".protyle-title__input");
+                if (titleEl && titleEl.textContent) return titleEl.textContent.trim();
+            }
+            // 方式3：标签页标题
+            var tab = document.querySelector('.layout-tab-bar .item--focus');
+            if (tab && tab.textContent) return tab.textContent.trim();
+        } catch (e) {}
+        return "";
+    }
     onDocChange(fn) { this._onDocChange = fn; }
 }
 
@@ -1012,6 +1033,35 @@ class Storage {
         // 移动端不需要 basePath，直接用 localStorage
     }
 
+    // 查找文档目录（优先新命名，回退旧命名，不创建）
+    _findDocDir(docId) {
+        if (!IS_DESKTOP) return docId;
+        var oldDir = this._basePath + "/" + docId;
+        // 扫描 basePath 下匹配 docId 后缀的目录
+        if (fs.existsSync(oldDir)) return oldDir;
+        try {
+            var files = fs.readdirSync(this._basePath);
+            var suffix = "_" + docId.slice(0, 8);
+            for (var i = 0; i < files.length; i++) {
+                var full = this._basePath + "/" + files[i];
+                if (files[i].slice(-suffix.length) === suffix && fs.statSync(full).isDirectory()) {
+                    return full;
+                }
+            }
+        } catch (e) {}
+        return oldDir; // 回退旧路径
+    }
+
+    // 创建文档目录（新命名）
+    _createDocDir(docId, title) {
+        var safeTitle = (title || docId).replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, "_").slice(0, 60);
+        var newDir = this._basePath + "/" + safeTitle + "_" + docId.slice(0, 8);
+        if (!fs.existsSync(newDir)) {
+            try { fs.mkdirSync(newDir, { recursive: true }); } catch (e) {}
+        }
+        return newDir;
+    }
+
     save(docId, config, layers) {
         if (IS_DESKTOP) {
             return this._saveDesktop(docId, config, layers);
@@ -1038,10 +1088,23 @@ class Storage {
 
     deleteLayerImage(docId, layerId) {
         if (IS_DESKTOP) {
-            const filePath = this._basePath + "/" + docId + "/layer" + layerId + ".png";
-            if (fs.existsSync(filePath)) {
-                try { fs.unlinkSync(filePath); } catch (e) { console.warn("[DocumentDrawing] delete layer image failed:", e.message); }
-            }
+            var dir = this._findDocDir(docId);
+            var candidates = [];
+            try {
+                var cfgPath = dir + "/config.json";
+                if (fs.existsSync(cfgPath)) {
+                    var cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+                    if (cfg && cfg.layers) {
+                        var layer = cfg.layers.find(function (l) { return l.id === layerId; });
+                        if (layer && layer.file) candidates.push(layer.file);
+                    }
+                }
+            } catch (e) {}
+            candidates.push("layer" + layerId + ".png");
+            candidates.forEach(function (f) {
+                var fp = dir + "/" + f;
+                if (fs.existsSync(fp)) { try { fs.unlinkSync(fp); } catch (e) {} }
+            });
         } else {
             try { localStorage.removeItem(LS_IMG_PREFIX + docId + "_" + layerId); } catch (e) {}
         }
@@ -1049,16 +1112,36 @@ class Storage {
 
     // ========== 桌面端实现（Node.js fs） ==========
     _saveDesktop(docId, config, layers) {
-        const dir = this._basePath + "/" + docId;
-        if (!fs.existsSync(dir)) { try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { return false; } }
+        const dir = this._createDocDir(docId, config._docTitle || "");
         try { fs.writeFileSync(dir + "/config.json", JSON.stringify(config, null, 2), "utf-8"); } catch (e) { return false; }
         if (layers) {
+            // 收集当前图层 file 引用
+            var validFiles = {};
+            layers.forEach(function (l) {
+                var lf = l.file || ((l.name || ("图层" + l.id)).replace(/[\\/:*?"<>|]/g, "_").slice(0, 50) + "_" + l.id + ".png");
+                validFiles[lf] = true;
+            });
+            // 清理已删除图层的残留文件
+            try {
+                var files = fs.readdirSync(dir);
+                files.forEach(function (f) {
+                    if (/\.png$/.test(f) && f !== "config.json" && !validFiles[f]) {
+                        try { fs.unlinkSync(dir + "/" + f); } catch (e) {}
+                    }
+                });
+            } catch (e) {}
+            // 保存当前图层
             layers.forEach(layer => {
                 if (layer.canvas) {
                     try {
+                        // 用图层名命名图片文件
+                        var lName = (layer.name || ("图层" + layer.id)).replace(/[\\/:*?"<>|]/g, "_").slice(0, 50);
+                        var lFile = lName + "_" + layer.id + ".png";
                         const dataUrl = layer.canvas.toDataURL("image/png");
                         const base64 = dataUrl.replace(/^data:image\/png;base64,/, "");
-                        fs.writeFileSync(dir + "/layer" + layer.id + ".png", Buffer.from(base64, "base64"));
+                        fs.writeFileSync(dir + "/" + lFile, Buffer.from(base64, "base64"));
+                        // 更新 layer.file 引用
+                        layer.file = lFile;
                     } catch (e) {}
                 }
             });
@@ -1067,14 +1150,27 @@ class Storage {
     }
 
     _loadDesktop(docId, callback) {
-        const dir = this._basePath + "/" + docId;
-        const cfgPath = dir + "/config.json";
+        var dir = this._findDocDir(docId);
+        var cfgPath = dir + "/config.json";
         if (!fs.existsSync(cfgPath)) { callback(null); return; }
         try { callback(JSON.parse(fs.readFileSync(cfgPath, "utf-8"))); } catch (e) { callback(null); }
     }
 
     _loadLayerImageDesktop(docId, layerId, callback) {
-        const filePath = this._basePath + "/" + docId + "/layer" + layerId + ".png";
+        var dir = this._findDocDir(docId);
+        var cfgPath = dir + "/config.json";
+        var layer = null;
+        try {
+            if (fs.existsSync(cfgPath)) {
+                var cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+                if (cfg && cfg.layers) {
+                    layer = cfg.layers.find(function (l) { return l.id === layerId; });
+                }
+            }
+        } catch (e) {}
+        var fileName = (layer && layer.file) ? layer.file : ("layer" + layerId + ".png");
+        var filePath = dir + "/" + fileName;
+        if (!fs.existsSync(filePath)) filePath = dir + "/layer" + layerId + ".png";
         if (!fs.existsSync(filePath)) { callback(null); return; }
         const img = new Image();
         img.onload = function () { callback(img); };
@@ -1223,8 +1319,12 @@ class ExportManager {
             canvas = sc;
         }
         var dataUrl = canvas.toDataURL("image/png");
+        var docTitle = "";
+        try { docTitle = this._docManager ? this._docManager.getDocumentTitle() : ""; } catch (e) {}
+        if (!docTitle) docTitle = docId;
+        docTitle = docTitle.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, "_").slice(0, 80);
         var ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-        var fn = "drawing-" + docId + "-" + ts + ".png";
+        var fn = docTitle + "_" + ts + ".png";
 
         // ★ 平板端：用 fetchPost 上传到思源本地服务器获取链接
         if (!IS_DESKTOP && typeof _siyuanFetchPost === "function") {
@@ -1461,7 +1561,9 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
         try {
             const docId = this._docManager.getDocumentID();
             if (!docId) return;
-            this._storage.save(docId, this._layerManager.toConfig(), this._layerManager.getLayers());
+            var cfg = this._layerManager.toConfig();
+            cfg._docTitle = this._docManager.getDocumentTitle() || docId;
+            this._storage.save(docId, cfg, this._layerManager.getLayers());
             console.log("[DocumentDrawing] auto-saved", docId);
         } catch (e) { console.warn("[DocumentDrawing] auto-save failed:", e.message); }
     }
@@ -2542,7 +2644,9 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
         el.querySelector("#dlg-save").onclick = function () {
             if (self._layerManager && self._storage) {
                 const docId = self._docManager ? self._docManager.getDocumentID() : "default";
-                self._storage.save(docId, self._layerManager.toConfig(), self._layerManager.getLayers());
+                var cfg2 = self._layerManager.toConfig();
+                cfg2._docTitle = self._docManager ? self._docManager.getDocumentTitle() : docId;
+                self._storage.save(docId, cfg2, self._layerManager.getLayers());
                 siyuan.showMessage("✅ 已保存", 2000);
             }
         };
@@ -2714,7 +2818,11 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
                 var pdfBlob = self._buildPdfBlobFromCanvas(finalCanvas);
                 if (!pdfBlob) { self._showExportPreview(null); return; }
                 var ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-                var fn = "drawing-" + docId + "-" + ts + ".pdf";
+                var docTitle2 = "";
+                try { docTitle2 = self._docManager ? self._docManager.getDocumentTitle() : ""; } catch (e) {}
+                if (!docTitle2) docTitle2 = docId;
+                docTitle2 = docTitle2.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, "_").slice(0, 80);
+                var fn = docTitle2 + "_" + ts + ".pdf";
                 var formData = new FormData();
                 formData.append("file", pdfBlob, fn);
                 formData.append("type", "application/pdf");
@@ -2796,6 +2904,17 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
             mergeLayers(fallback);
             self._buildAndDownloadPDF(fallback);
         }
+    }
+
+    // 生成导出文件名：文档标题_图层名.扩展名
+    _makeExportName(docId, ext) {
+        var title = "";
+        try { title = this._docManager ? this._docManager.getDocumentTitle() : ""; } catch (e) {}
+        if (!title) title = docId;
+        // 替换文件名非法字符
+        title = title.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, "_").slice(0, 80);
+        var ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        return title + "_" + ts + ext;
     }
 
     // PDF blob 构建（独立于下载，供平板端上传用）
