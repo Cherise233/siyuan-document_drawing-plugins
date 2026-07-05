@@ -1,0 +1,18 @@
+{
+  "brushSize": 2,
+  "brushColor": "#000000",
+  "brushOpacity": 100,
+  "highlighterSize": 20,
+  "highlighterOpacity": 60,
+  "autoSave": true,
+  "fingerDoubleTapEnabled": true,
+  "twoFingerUndoEnabled": true,
+  "exportPath": "",
+  "presetColors": [
+    "#000000",
+    "#E02020",
+    "#FFC000",
+    "#2060E0",
+    "#20A020"
+  ]
+}

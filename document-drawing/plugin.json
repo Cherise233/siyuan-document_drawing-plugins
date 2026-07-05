@@ -1,0 +1,38 @@
+{
+  "name": "document-drawing",
+  "author": "Cherise",
+  "url": "",
+  "version": "1.0.0",
+  "minAppVersion": "3.0.0",
+  "backends": [
+    "windows",
+    "linux",
+    "darwin",
+    "android",
+    "ios",
+    "harmony"
+  ],
+  "frontends": [
+    "desktop",
+    "mobile"
+  ],
+  "displayName": {
+    "default": "Document Drawing",
+    "zh_CN": "文档绘图"
+  },
+  "description": {
+    "default": "Draw on SiYuan documents with multiple transparent layers",
+    "zh_CN": "在思源文档上实现多图层绘图，类似 Word Draw 功能"
+  },
+  "readme": {
+    "default": "README.md",
+    "zh_CN": "README.md"
+  },
+  "keywords": [
+    "draw",
+    "paint",
+    "layer",
+    "绘图",
+    "图层"
+  ]
+}
