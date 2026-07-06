@@ -27,9 +27,24 @@ class DocumentManager {
         this._pollTimer = null;
         this._clickHandler = null;
         this._focusHandler = null;
-        this.detectCurrentDocument();
-        this._startWatch();
+        this._rootIdResolver = null;  // UUID → root_id 解析函数
+        this._resolvingUuid = null;   // 正在解析中的 UUID（防重复）
+        this._lastUuid = null;        // 上次解析为 root_id 的 UUID
+        this._lastTitle = null;       // 上次解析时的文档标题（切换文档检测）
+        this._prevDocId = null;       // 切文档前的旧 root_id（传给 _onDocChange）
+        this._resolveTimer = null;    // 延迟解析计时器
+        // ★ 延迟启动监听——等 setRootIdResolver 注入后由外部调用 startWatch
     }
+
+    // 注入 root_id 解析器并启动监听
+    init(resolver) {
+        this._rootIdResolver = resolver;
+        this._startWatch();
+        this.detectCurrentDocument();
+    }
+
+    // 注入 root_id 解析器（由插件提供 SQL 查询能力）
+    setRootIdResolver(fn) { this._rootIdResolver = fn; }
 
     detectCurrentDocument() {
         try {
@@ -124,15 +139,76 @@ class DocumentManager {
                     "activeEditor:", !!activeEditor,
                     "hash:", window.location.hash?.slice(0, 30),
                     "siyuan:", !!(window.siyuan && window.siyuan.editor));
+                if (!this._docId) this._docId = "_unknown_" + Date.now();
                 return;
             }
 
-            if (newId !== this._docId) {
-                const oldId = this._docId;
-                console.log("[DocumentManager] document changed:", oldId, "->", newId);
-                this._docId = newId;
-                if (this._onDocChange) this._onDocChange(newId, oldId);
+            // ★ 判断 ID 类型
+            var isRootId = /^\d{14}-[a-z0-9]{7}$/.test(newId);
+            var isUuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(newId);
+
+            // ★ 已有 root_id → 稳定！UUID 变化只更新引用，不清理 root_id
+            if (this._docId && /^\d{14}-[a-z0-9]{7}$/.test(this._docId) && isUuid) {
+                if (newId !== this._lastUuid) {
+                    this._lastUuid = newId;
+                    var curTitle = "";
+                    try { curTitle = this.getDocumentTitle(); } catch (e) {}
+                    if (curTitle && this._lastTitle && curTitle !== this._lastTitle) {
+                        console.log("[DocumentManager] title changed, re-resolving:", this._lastTitle, "→", curTitle);
+                        this._prevDocId = this._docId;
+                        this._lastTitle = curTitle;
+                        // ★ 立即触发保存旧文档（通过 _onDocChange 模拟）
+                        if (this._onDocChange) this._onDocChange(null, this._docId);
+                        this._docId = null;
+                    } else if (!this._lastTitle) {
+                        this._lastTitle = curTitle;
+                    }
+                }
+                if (this._docId) return;
             }
+
+            // ★ root_id 没变 → 跳过
+            if (newId === this._docId && !isUuid) return;
+            // UUID 没变且正在解析 → 跳过
+            if (isUuid && this._resolvingUuid === newId) return;
+
+            // ★ UUID：先解析为 root_id 再设置 _docId
+            if (isUuid && this._rootIdResolver) {
+                this._resolvingUuid = newId;
+                var self = this;
+                // ★ 延迟 300ms 再解析：切文档时 DOM 事件先到，标签页标题可能还没更新
+                // 如果立刻 getDocumentTitle() 会拿到旧文档的标题 → 两个文档串 ID
+                clearTimeout(this._resolveTimer);
+                this._resolveTimer = setTimeout(function () {
+                    if (self._resolvingUuid !== newId) return;
+                    self._resolvingUuid = null;
+                    var title = "";
+                    try { title = self.getDocumentTitle(); } catch (e) {}
+                    console.log("[DocumentManager] resolving UUID → root_id:", title);
+                    self._rootIdResolver(newId, title, function (rootId) {
+                        if (rootId && /^\d{14}-[a-z0-9]{7}$/.test(rootId) && rootId !== self._docId) {
+                            // ★ oldId：优先用切文档时保存的 _prevDocId，否则用当前 _docId
+                            var old = self._prevDocId || self._docId;
+                            self._prevDocId = null;
+                            self._docId = rootId;
+                            self._lastUuid = newId;
+                            self._lastTitle = title;
+                            console.log("[DocumentManager] resolved:", rootId, "title:", title, "old:", old);
+                            if (self._onDocChange) self._onDocChange(rootId, old);
+                        } else if (!rootId) {
+                            console.log("[DocumentManager] resolution failed for:", title);
+                        }
+                    });
+                }, 300);
+                return;
+            }
+
+            // ★ 其他情况：直接使用
+            console.log("[DocumentManager] document changed:", this._docId, "->", newId);
+            var oldId = this._docId;
+            this._docId = newId;
+            if (newId && /^\d{14}-[a-z0-9]{7}$/.test(newId)) this._lastUuid = null;  // root_id 直接用的，不记 UUID
+            if (this._onDocChange) this._onDocChange(newId, oldId);
         } catch (e) { console.warn("[DocumentManager] detectCurrentDocument error:", e); }
     }
 
@@ -194,7 +270,7 @@ class DocumentManager {
         if (this._clickHandler) { document.removeEventListener("click", this._clickHandler, true); this._clickHandler = null; }
         if (this._focusHandler) { document.removeEventListener("focusin", this._focusHandler, true); this._focusHandler = null; }
     }
-    getDocumentID() { if (!this._docId) this.detectCurrentDocument(); return this._docId || "default"; }
+    getDocumentID() { if (!this._docId) this.detectCurrentDocument(); return this._docId || null; }
     getDocumentDOM() {
         // 优先通过文档 ID 定位对应的编辑器
         const allEditors = document.querySelectorAll(".protyle-wysiwyg");
@@ -285,6 +361,7 @@ class LayerManager {
         if (this._currentLayerId === id) {
             this._currentLayerId = this._layers.length > 0 ? this._layers[this._layers.length - 1].id : null;
         }
+        this._nextId = this._layers.length > 0 ? Math.max(...this._layers.map(l => l.id)) + 1 : 1;
         this._notify();
     }
 
@@ -1033,29 +1110,62 @@ class Storage {
         // 移动端不需要 basePath，直接用 localStorage
     }
 
-    // 查找文档目录（优先新命名，回退旧命名，不创建）
-    _findDocDir(docId) {
+    // 查找文档目录（优先 docId 后缀匹配，回退标题匹配，不创建）
+    _findDocDir(docId, docTitle) {
         if (!IS_DESKTOP) return docId;
         var oldDir = this._basePath + "/" + docId;
-        // 扫描 basePath 下匹配 docId 后缀的目录
         if (fs.existsSync(oldDir)) return oldDir;
         try {
             var files = fs.readdirSync(this._basePath);
-            var suffix = "_" + docId.slice(0, 8);
+            // 策略 1：匹配 docId 后 12 位后缀（避免同日文档 8 位碰撞）
+            var idSuffix = docId.length >= 12 ? docId.slice(-12) : docId;
             for (var i = 0; i < files.length; i++) {
                 var full = this._basePath + "/" + files[i];
-                if (files[i].slice(-suffix.length) === suffix && fs.statSync(full).isDirectory()) {
+                if (files[i].slice(-idSuffix.length) === idSuffix && fs.statSync(full).isDirectory()) {
                     return full;
                 }
             }
+            // 策略 2：匹配 _docId 或 _docTitle（处理 UUID 跨会话变化）
+            if (docTitle) {
+                var safeTitle = docTitle.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, "_").slice(0, 60);
+                for (var j = 0; j < files.length; j++) {
+                    var full2 = this._basePath + "/" + files[j];
+                    if (!fs.statSync(full2).isDirectory()) continue;
+                    // 目录名以标题开头（处理改名和 UUID 变化）
+                    if (files[j].indexOf(safeTitle) === 0) {
+                        // 验证 config 里的 _docTitle 匹配
+                        try {
+                            var cfgPath2 = full2 + "/config.json";
+                            if (fs.existsSync(cfgPath2)) {
+                                var cfg2 = JSON.parse(fs.readFileSync(cfgPath2, "utf-8"));
+                                if (cfg2 && cfg2._docTitle === docTitle) return full2;
+                            }
+                        } catch (e) {}
+                    }
+                }
+                // 策略 3：扫描所有 config 匹配 _docTitle
+                for (var k = 0; k < files.length; k++) {
+                    var full3 = this._basePath + "/" + files[k];
+                    if (!fs.statSync(full3).isDirectory()) continue;
+                    try {
+                        var cfgPath3 = full3 + "/config.json";
+                        if (fs.existsSync(cfgPath3)) {
+                            var cfg3 = JSON.parse(fs.readFileSync(cfgPath3, "utf-8"));
+                            if (cfg3 && cfg3._docTitle === docTitle) return full3;
+                        }
+                    } catch (e) {}
+                }
+            }
         } catch (e) {}
-        return oldDir; // 回退旧路径
+        return oldDir;
     }
 
-    // 创建文档目录（新命名）
+    // 创建文档目录（标题 + 完整 root_id 后 12 位，避免同一天创建的文档碰撞）
     _createDocDir(docId, title) {
-        var safeTitle = (title || docId).replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, "_").slice(0, 60);
-        var newDir = this._basePath + "/" + safeTitle + "_" + docId.slice(0, 8);
+        var safeTitle = (title || docId).replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, "_").slice(0, 50);
+        // 取 root_id 后 12 位（含 - 和 7 位随机字符），确保唯一性
+        var idSuffix = docId.length >= 12 ? docId.slice(-12) : docId;
+        var newDir = this._basePath + "/" + safeTitle + "_" + idSuffix;
         if (!fs.existsSync(newDir)) {
             try { fs.mkdirSync(newDir, { recursive: true }); } catch (e) {}
         }
@@ -1112,7 +1222,15 @@ class Storage {
 
     // ========== 桌面端实现（Node.js fs） ==========
     _saveDesktop(docId, config, layers) {
-        const dir = this._createDocDir(docId, config._docTitle || "");
+        config._docId = docId;  // ★ 确保 config 始终写入正确的 _docId
+        // ★ 先找已有目录（按标题匹配，处理 UUID 跨会话变化），找不到再新建
+        var existingDir = this._findDocDir(docId, config._docTitle);
+        var dir;
+        if (existingDir !== (this._basePath + "/" + docId) || fs.existsSync(existingDir)) {
+            dir = existingDir;  // 找到了已有目录
+        } else {
+            dir = this._createDocDir(docId, config._docTitle || "");
+        }
         try { fs.writeFileSync(dir + "/config.json", JSON.stringify(config, null, 2), "utf-8"); } catch (e) { return false; }
         if (layers) {
             // 收集当前图层 file 引用
@@ -1152,20 +1270,56 @@ class Storage {
     _loadDesktop(docId, callback) {
         var dir = this._findDocDir(docId);
         var cfgPath = dir + "/config.json";
-        if (!fs.existsSync(cfgPath)) { callback(null); return; }
+        // 后缀匹配失败 → 扫描所有目录按 _docId 匹配
+        if (!fs.existsSync(cfgPath)) {
+            try {
+                var files = fs.readdirSync(this._basePath);
+                for (var i = 0; i < files.length; i++) {
+                    var f = this._basePath + "/" + files[i] + "/config.json";
+                    if (fs.existsSync(f)) {
+                        try {
+                            var c = JSON.parse(fs.readFileSync(f, "utf-8"));
+                            if (c && c._docId === docId) {
+                                callback(c); return;
+                            }
+                        } catch (e) {}
+                    }
+                }
+            } catch (e) {}
+            callback(null); return;
+        }
         try { callback(JSON.parse(fs.readFileSync(cfgPath, "utf-8"))); } catch (e) { callback(null); }
     }
 
     _loadLayerImageDesktop(docId, layerId, callback) {
+        // 复用 _loadDesktop 的查找逻辑：先后缀匹配，再扫描所有 config 按 _docId 匹配
         var dir = this._findDocDir(docId);
         var cfgPath = dir + "/config.json";
+        if (!fs.existsSync(cfgPath)) {
+            // 扫描所有目录找匹配 _docId 的 config
+            try {
+                var files = fs.readdirSync(this._basePath);
+                for (var i = 0; i < files.length; i++) {
+                    var f = this._basePath + "/" + files[i] + "/config.json";
+                    if (fs.existsSync(f)) {
+                        try {
+                            var c = JSON.parse(fs.readFileSync(f, "utf-8"));
+                            if (c && c._docId === docId) {
+                                dir = this._basePath + "/" + files[i];
+                                cfgPath = f;
+                                break;
+                            }
+                        } catch (e) {}
+                    }
+                }
+            } catch (e) {}
+        }
+        if (!fs.existsSync(cfgPath)) { callback(null); return; }
         var layer = null;
         try {
-            if (fs.existsSync(cfgPath)) {
-                var cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
-                if (cfg && cfg.layers) {
-                    layer = cfg.layers.find(function (l) { return l.id === layerId; });
-                }
+            var cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+            if (cfg && cfg.layers) {
+                layer = cfg.layers.find(function (l) { return l.id === layerId; });
             }
         } catch (e) {}
         var fileName = (layer && layer.file) ? layer.file : ("layer" + layerId + ".png");
@@ -1220,6 +1374,105 @@ class Storage {
             img.onerror = function () { callback(null); };
             img.src = dataUrl;
         } catch (e) { callback(null); }
+    }
+
+    // ========== 全局扫描：列出所有文档及其图层 ==========
+    listAllDocuments(callback) {
+        if (IS_DESKTOP) {
+            this._listAllDesktop(callback);
+        } else {
+            this._listAllMobile(callback);
+        }
+    }
+
+    _listAllDesktop(callback) {
+        var result = [];
+        if (!fs.existsSync(this._basePath)) { callback(result); return; }
+        var self = this;
+        try {
+            var dirs = fs.readdirSync(this._basePath);
+            dirs.forEach(function (dirName) {
+                var fullDir = self._basePath + "/" + dirName;
+                try {
+                    if (!fs.statSync(fullDir).isDirectory()) return;
+                    var cfgPath = fullDir + "/config.json";
+                    if (!fs.existsSync(cfgPath)) return;
+                    var cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+                    if (!cfg) return;
+                    var docId = cfg._docId || "";
+                    if (!docId) {
+                        var lastUnderscore = dirName.lastIndexOf("_");
+                        if (lastUnderscore >= 0 && lastUnderscore < dirName.length - 1) {
+                            var suffix = dirName.slice(lastUnderscore + 1);
+                            if (/^[a-zA-Z0-9]{8}$/.test(suffix)) docId = suffix;
+                            else docId = dirName;
+                        } else docId = dirName;
+                    }
+                    var docTitle = cfg._docTitle || dirName;
+                    var layers = (cfg.layers || []).map(function (l) {
+                        return { id: l.id, name: l.name || ("图层 " + l.id), visible: l.visible !== false, file: l.file || "" };
+                    });
+                    result.push({ docId: docId, docTitle: docTitle, dirName: dirName, layers: layers });
+                } catch (e) {}
+            });
+        } catch (e) {}
+        callback(result);
+    }
+
+    _listAllMobile(callback) {
+        var result = [];
+        try {
+            for (var i = 0; i < localStorage.length; i++) {
+                var key = localStorage.key(i);
+                if (key && key.indexOf(LS_PREFIX) === 0) {
+                    try {
+                        var docId = key.slice(LS_PREFIX.length);
+                        var cfg = JSON.parse(localStorage.getItem(key));
+                        if (!cfg) continue;
+                        var docTitle = cfg._docTitle || docId;
+                        var layers = (cfg.layers || []).map(function (l) {
+                            return { id: l.id, name: l.name || ("图层 " + l.id), visible: l.visible !== false, file: l.file || "" };
+                        });
+                        result.push({ docId: docId, docTitle: docTitle, dirName: docId, layers: layers });
+                    } catch (e) {}
+                }
+            }
+        } catch (e) {}
+        callback(result);
+    }
+
+    // 将 config.json 中的 _docId 从 uuid 更新为 root_id
+    updateDocId(uuid, rootId, callback) {
+        if (IS_DESKTOP) {
+            var dir = this._findDocDir(uuid);
+            var cfgPath = dir + "/config.json";
+            try {
+                if (fs.existsSync(cfgPath)) {
+                    var cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+                    if (cfg && cfg._docId === uuid) {
+                        cfg._docId = rootId;
+                        fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), "utf-8");
+                        callback(true);
+                        return;
+                    }
+                }
+            } catch (e) {}
+            callback(false);
+        } else {
+            try {
+                var raw = localStorage.getItem(LS_PREFIX + uuid);
+                if (raw) {
+                    var cfg2 = JSON.parse(raw);
+                    cfg2._docId = rootId;
+                    localStorage.setItem(LS_PREFIX + uuid, JSON.stringify(cfg2));
+                    // 同时写入 rootId key，下次直接查找
+                    localStorage.setItem(LS_PREFIX + rootId, JSON.stringify(cfg2));
+                    callback(true);
+                    return;
+                }
+            } catch (e) {}
+            callback(false);
+        }
     }
 }
 
@@ -1532,6 +1785,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
         this._toolbarEl = null;
         this._menuEl = null;
         this._layerDialog = null;  // 图层管理对话框引用
+        this._userClosedToolbar = false;  // 用户是否手动关了工具栏
         this._pluginDir = this.dataDir ? this.dataDir.replace(/\/$/, "") : "D:/思源笔记/Cherise WorkPlace/data/plugins/document-drawing";
         this._workspacePath = this.dataDir ? this.dataDir.replace(/\/data\/plugins\/.*$/, "") : "D:/思源笔记/Cherise WorkPlace";
 
@@ -1560,16 +1814,37 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
         if (!this._storage || !this._layerManager || !this._docManager) return;
         try {
             const docId = this._docManager.getDocumentID();
-            if (!docId) return;
+            // ★ 只保存有效的 root_id，UUID 阶段不保存
+            if (!docId || !/^\d{14}-[a-z0-9]{7}$/.test(docId)) return;
             var cfg = this._layerManager.toConfig();
             cfg._docTitle = this._docManager.getDocumentTitle() || docId;
+            cfg._docId = docId;
             this._storage.save(docId, cfg, this._layerManager.getLayers());
             console.log("[DocumentDrawing] auto-saved", docId);
         } catch (e) { console.warn("[DocumentDrawing] auto-save failed:", e.message); }
     }
 
     onunload() {
-        this._autoSave();
+        // ★ 退出时无论如何都要保存（即使 root_id 未就绪，用标题兜底）
+        if (!this._storage || !this._layerManager || !this._docManager) return;
+        try {
+            var docId = this._docManager.getDocumentID();
+            var docTitle = this._docManager.getDocumentTitle() || "";
+            // 没有有效 root_id → 用标题生成临时 ID 保存
+            if (!docId || !/^\d{14}-[a-z0-9]{7}$/.test(docId)) {
+                docId = "_exit_" + docTitle.replace(/[^a-zA-Z0-9一-鿿]/g, "_").slice(0, 40);
+                if (!docId || docId === "_exit_") docId = "_exit_unknown";
+                console.log("[DocumentDrawing] exit-save with fallback ID:", docId);
+            }
+            var cfg = this._layerManager.toConfig();
+            cfg._docTitle = docTitle;
+            cfg._docId = docId;
+            // 只有有图层内容才保存
+            if (this._layerManager.getLayers().length > 0) {
+                this._storage.save(docId, cfg, this._layerManager.getLayers());
+                console.log("[DocumentDrawing] exit-saved", docId);
+            }
+        } catch (e) { console.warn("[DocumentDrawing] exit-save failed:", e.message); }
         this._removeOverlay();
         this._removeToolbar();
         this.closeMenu();
@@ -1624,6 +1899,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
         const items = [
             { icon: "✏️", label: "添加图层", action: "add-layer" },
             { icon: "📂", label: "查看 / 管理图层", action: "show-layers" },
+            { icon: "🗂️", label: "查看所有图层", action: "show-all-layers" },
             { icon: "💾", label: "导出", action: "export" },
             { type: "separator" },
             { icon: "⚙️", label: "设置", action: "settings" }
@@ -1689,6 +1965,9 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
             case "show-layers":
                 this._showLayerListDialog();
                 break;
+            case "show-all-layers":
+                this._showAllLayersDialog();
+                break;
             case "export":
                 this._showExportDialog();
                 break;
@@ -1703,6 +1982,11 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
         if (this._layerManager) return;
         try {
             this._docManager = new DocumentManager();
+            // ★ 注入 root_id 解析器并启动监听（确保 detect 时 resolver 已就绪）
+            var self0 = this;
+            this._docManager.init(function (uuid, title, cb) {
+                self0._resolveUuidToRootId(uuid, title, cb);
+            });
             this._layerManager = new LayerManager();
             this._canvasManager = new CanvasManager();
             this._storage = new Storage(this._workspacePath);
@@ -1746,35 +2030,48 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
             console.log("[DocumentDrawing] registering onDocChange callback");
             this._docManager.onDocChange(function (newDocId, oldDocId) {
                 console.log("[DocumentDrawing] document changed from", oldDocId, "to", newDocId);
-                // 1. 用旧文档 ID 保存旧文档的图层数据（关键！_docId 已被更新为新 ID）
-                if (oldDocId && self._layerManager._layers.length > 0) {
-                    self._storage.save(oldDocId, self._layerManager.toConfig(), self._layerManager.getLayers());
-                    console.log("[DocumentDrawing] saved old document:", oldDocId);
+                // ★ 判断是否为同一文档的 ID 转换（null→root_id 或 UUID→root_id）
+                var isFirstResolve = !oldDocId;
+                var isUuidToRootId = oldDocId && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(oldDocId);
+                var isSameDoc = isFirstResolve || isUuidToRootId;
+
+                if (!isSameDoc) {
+                    // ★ 真正的文档切换：保存旧文档 + 重置
+                    if (oldDocId && self._layerManager._layers.length > 0) {
+                        self._storage.save(oldDocId, self._layerManager.toConfig(), self._layerManager.getLayers());
+                        console.log("[DocumentDrawing] saved old document:", oldDocId);
+                    }
+                    self._layerManager._layers = [];
+                    self._layerManager._currentLayerId = null;
+                    self._layerManager._nextId = 1;
+                    self._canvasManager._canvases = {};
+                    self._canvasManager._currentLayerId = null;
+                    console.log("[DocumentDrawing] layer data reset");
+                    if (self._layerDialog) {
+                        try { self._layerDialog.destroy(); } catch (e) {}
+                        self._layerDialog = null;
+                    }
+                    self._removeOverlay();
+                    self._removeToolbar();
+                } else {
+                    console.log("[DocumentDrawing] same-doc transition, keep layers intact");
                 }
-                // 2. 重置所有图层数据
-                self._layerManager._layers = [];
-                self._layerManager._currentLayerId = null;
-                self._layerManager._nextId = 1;
-                self._canvasManager._canvases = {};
-                self._canvasManager._currentLayerId = null;
-                console.log("[DocumentDrawing] layer data reset");
-                // 3. 关闭旧图层对话框（显示的是旧文档的数据）
-                if (self._layerDialog) {
-                    try { self._layerDialog.destroy(); } catch (e) {}
-                    self._layerDialog = null;
-                }
-                // 4. 移除旧覆盖层和工具栏
-                self._removeOverlay();
-                self._removeToolbar();
-                console.log("[DocumentDrawing] old overlay/toolbar/dialog removed");
-                // 4. 加载新文档的图层
+
+                // 加载新文档的图层
                 self._storage.load(newDocId, function (config) {
-                    console.log("[DocumentDrawing] loading new document config:", config);
+                    console.log("[DocumentDrawing] loading config for:", newDocId, config);
                     if (config && config.layers && config.layers.length > 0) {
-                        self._layerManager.loadFromConfig(config);
-                        self._rebuildOverlay(newDocId);
-                    } else {
-                        // 新文档没有图层，不自动显示工具栏
+                        if (isSameDoc && self._layerManager._layers.length > 0) {
+                            console.log("[DocumentDrawing] same-doc, keeping existing layers");
+                            self._layerManager.loadFromConfig(config);
+                        } else {
+                            self._layerManager.loadFromConfig(config);
+                            // ★ 工具栏和画布同步：用户关了就不重建，开着就重建
+                            if (!self._userClosedToolbar) {
+                                self._rebuildOverlay(newDocId);
+                            }
+                        }
+                    } else if (!isSameDoc) {
                         console.log("[DocumentDrawing] new document has no saved layers");
                     }
                 });
@@ -1862,8 +2159,18 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
     }
 
     _addLayerAndShow() {
+        this._userClosedToolbar = false;
         if (!this._layerManager) this._initManagers();
         this._syncDocumentLayers();
+
+        // ★ 用户之前关了 → 先完整重建
+        if (!this._toolbarEl || !document.body.contains(this._toolbarEl)) {
+            var docId = this._docManager ? this._docManager.getDocumentID() : null;
+            if (docId && this._layerManager.getLayers().length > 0) {
+                this._rebuildOverlay(docId);
+                return;
+            }
+        }
 
         const editor = this._docManager ? this._docManager.getDocumentDOM() : null;
         if (!editor) { siyuan.showMessage("⚠️ 请先打开一个文档", 2000); return; }
@@ -2007,6 +2314,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
     }
 
     _rebuildOverlay(docId) {
+        this._userClosedToolbar = false;  // 主动重建时重置标记
         this._removeOverlay();
         const editor = this._docManager ? this._docManager.getDocumentDOM() : null;
         if (!editor) return;
@@ -2074,7 +2382,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
             { type: "separator" },
             { icon: "↩️", title: "撤销上一笔", action: "undo" },
             { icon: "🗑️", title: "清空当前图层", action: "clear" },
-            { icon: "💾", title: "导出", action: "export" },
+            { icon: "💾", title: "保存图层", action: "save" },
             { type: "separator" },
             { icon: "📂", title: "图层管理", action: "layer-list" },
             { icon: "❌", title: "关闭绘图", action: "close" },
@@ -2146,12 +2454,14 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
                     const current = self._layerManager ? self._layerManager.getCurrentLayer() : null;
                     if (current && self._canvasManager) self._canvasManager.clearLayer(current.id);
                 };
+            } else if (item.action === "save") {
+                btn.onclick = function () { self._autoSave(); siyuan.showMessage("✅ 已保存", 2000); };
             } else if (item.action === "export") {
                 btn.onclick = function () { self._showExportDialog(); };
             } else if (item.action === "layer-list") {
                 btn.onclick = function () { self._showLayerListDialog(); };
             } else if (item.action === "close") {
-                btn.onclick = function () { self._autoSave(); self._removeOverlay(); self._removeToolbar(); };
+                btn.onclick = function () { self._autoSave(); self._userClosedToolbar = true; self._removeOverlay(); self._removeToolbar(); };
             }
 
             tb.appendChild(btn);
@@ -2494,7 +2804,26 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
     _showLayerListDialog() {
         const self = this;
         if (!this._layerManager) this._initManagers();
-        this._syncDocumentLayers();  // 确保图层是当前文档的
+        this._syncDocumentLayers();
+
+        // ★ 如果 root_id 还没解析完，等解析完再打开弹窗
+        var docId = this._docManager ? this._docManager.getDocumentID() : null;
+        if (!docId || !/^\d{14}-[a-z0-9]{7}$/.test(docId)) {
+            siyuan.showMessage("⏳ 正在解析文档...", 1500);
+            var checkCount = 0;
+            var checkTimer = setInterval(function () {
+                checkCount++;
+                var id = self._docManager ? self._docManager.getDocumentID() : null;
+                if (id && /^\d{14}-[a-z0-9]{7}$/.test(id)) {
+                    clearInterval(checkTimer);
+                    self._showLayerListDialog();  // 重新调用
+                } else if (checkCount > 30) {
+                    clearInterval(checkTimer);
+                    siyuan.showMessage("⚠️ 文档解析超时", 3000);
+                }
+            }, 200);
+            return;
+        }
 
         const buildListHtml = function (layers, currentId) {
             if (layers.length === 0) return '<div style="padding:16px;color:#999;font-size:13px;">暂无图层，请先添加</div>';
@@ -2526,7 +2855,9 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
 
         // 关闭旧对话框（如果有）
         if (this._layerDialog) { try { this._layerDialog.destroy(); } catch (e) {} }
-        const dialog = new siyuan.Dialog({ title: "图层管理 — " + (this._docManager ? this._docManager.getDocumentID().slice(0, 8) : ""), content: html, width: "360px", height: "auto" });
+        var dlgDocId = this._docManager ? this._docManager.getDocumentID() : "";
+        var dlgIdLabel = dlgDocId;
+        const dialog = new siyuan.Dialog({ title: "图层管理 — " + dlgIdLabel, content: html, width: "400px", height: "auto" });
         this._layerDialog = dialog;
         const el = dialog.element;
         if (!el) { this._layerDialog = null; return; }
@@ -2564,6 +2895,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
                 }
                 self._layerManager.deleteLayer(id);
                 self._canvasManager.removeCanvas(id);
+                self._autoSave();  // 删除后立即保存，更新 config
                 const listEl = el.querySelector("#dlg-layer-list");
                 if (listEl) listEl.innerHTML = buildListHtml(self._layerManager.getLayers(), self._layerManager.getCurrentLayerId());
                 return;
@@ -2643,7 +2975,11 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
         };
         el.querySelector("#dlg-save").onclick = function () {
             if (self._layerManager && self._storage) {
-                const docId = self._docManager ? self._docManager.getDocumentID() : "default";
+                var docId = self._docManager ? self._docManager.getDocumentID() : null;
+                if (!docId || !/^\d{14}-[a-z0-9]{7}$/.test(docId)) {
+                    siyuan.showMessage("⚠️ 文档 ID 尚未就绪，请稍后再试", 2000);
+                    return;
+                }
                 var cfg2 = self._layerManager.toConfig();
                 cfg2._docTitle = self._docManager ? self._docManager.getDocumentTitle() : docId;
                 self._storage.save(docId, cfg2, self._layerManager.getLayers());
@@ -3338,6 +3674,289 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
             };
         }
     }
+
+    // ========== 查看所有图层 ==========
+    _showAllLayersDialog() {
+        var self = this;
+        if (!this._layerManager) this._initManagers();
+        if (!this._storage) { siyuan.showMessage("⚠️ 存储未初始化", 2000); return; }
+
+        var loadingHtml = '<div id="all-layers-content" style="padding:16px;min-width:420px;">' +
+            '<h3 style="margin:0 0 12px 0;font-size:15px;">🗂️ 所有图层总览</h3>' +
+            '<div style="padding:32px;text-align:center;color:#999;">⏳ 正在扫描...</div></div>';
+
+        var dialog = new siyuan.Dialog({ title: "所有图层总览", content: loadingHtml, width: "520px", height: "auto" });
+        var el = dialog.element;
+        if (!el) return;
+
+        this._storage.listAllDocuments(function (docs) {
+            var contentEl = el.querySelector("#all-layers-content");
+            if (!contentEl) return;
+            if (!docs || docs.length === 0) {
+                contentEl.innerHTML = '<h3 style="margin:0 0 12px 0;font-size:15px;">🗂️ 所有图层总览</h3>' +
+                    '<div style="padding:32px;text-align:center;color:#999;">暂无任何文档的绘图数据</div>';
+                return;
+            }
+            var totalLayers = 0;
+            docs.forEach(function (d) { totalLayers += d.layers.length; });
+            docs.sort(function (a, b) { return (a.docTitle || "").localeCompare(b.docTitle || ""); });
+
+            var html = '<h3 style="margin:0 0 8px 0;font-size:15px;">🗂️ 所有图层总览</h3>' +
+                '<div style="margin-bottom:10px;font-size:12px;color:#999;">共 ' + docs.length + ' 个文档，' + totalLayers + ' 个图层</div>' +
+                '<div id="all-layers-list" style="max-height:440px;overflow-y:auto;">';
+
+            docs.forEach(function (doc, docIdx) {
+                var docTitleEsc = (doc.docTitle || doc.docId).replace(/"/g, "&quot;").replace(/</g, "&lt;");
+                var layerCount = doc.layers.length;
+                var isCurrentDoc = self._docManager && doc.docId === self._docManager.getDocumentID();
+                var star = isCurrentDoc ? ' ⭐' : '';
+                html += '<div class="all-layers-doc" style="margin-bottom:6px;border:1px solid var(--b3-border-color,#eee);border-radius:8px;overflow:hidden;">' +
+                    '<div class="doc-header" style="padding:8px 12px;background:var(--b3-theme-second,#f5f7fa);cursor:pointer;display:flex;align-items:center;gap:6px;user-select:none;" data-doc-idx="' + docIdx + '">' +
+                    '<span class="doc-toggle" style="font-size:10px;color:#999;">▶</span>' +
+                    '<span style="font-size:14px;">📄</span>' +
+                    '<span style="flex:1;font-size:13px;font-weight:600;">' + docTitleEsc + star + '</span>' +
+                    '<span style="font-size:11px;color:#999;">' + layerCount + ' 层</span>' +
+                    '</div>' +
+                    '<div class="doc-layers" data-doc-idx="' + docIdx + '" style="display:none;">';
+                if (layerCount === 0) {
+                    html += '<div style="padding:8px 12px 8px 32px;font-size:12px;color:#999;">（空）</div>';
+                } else {
+                    doc.layers.forEach(function (l) {
+                        var eye = l.visible !== false ? '👁️' : '🚫';
+                        var layerNameEsc = (l.name || "图层 " + l.id).replace(/"/g, "&quot;").replace(/</g, "&lt;");
+                        html += '<div class="layer-row" data-doc-idx="' + docIdx + '" data-layer-id="' + l.id + '" style="display:flex;align-items:center;gap:6px;padding:4px 12px 4px 28px;font-size:12px;cursor:pointer;transition:background 0.1s;color:var(--b3-theme-on-background,#555);">' +
+                            '<span style="font-size:12px;opacity:0.7;">' + eye + '</span>' +
+                            '<span style="flex:1;">' + layerNameEsc + '</span>' +
+                            '<span class="jump-hint" style="font-size:10px;color:#ccc;opacity:0;">点击跳转 →</span>' +
+                            '</div>';
+                    });
+                }
+                html += '</div></div>';
+            });
+            html += '</div>';
+            contentEl.innerHTML = html;
+
+            // 文档折叠/展开
+            var headers = contentEl.querySelectorAll(".doc-header");
+            headers.forEach(function (hdr) {
+                hdr.onclick = function () {
+                    var idx = hdr.getAttribute("data-doc-idx");
+                    var layersEl = contentEl.querySelector('[data-doc-idx="' + idx + '"].doc-layers');
+                    var toggle = hdr.querySelector(".doc-toggle");
+                    if (layersEl) {
+                        var isOpen = layersEl.style.display !== "none";
+                        layersEl.style.display = isOpen ? "none" : "";
+                        if (toggle) toggle.style.transform = isOpen ? "" : "rotate(90deg)";
+                    }
+                };
+            });
+
+            // 图层行 hover 效果 + 点击跳转
+            var rows = contentEl.querySelectorAll(".layer-row");
+            rows.forEach(function (row) {
+                row.onmouseenter = function () { this.style.background = "var(--b3-list-hover, rgba(24,144,255,0.06))"; var h = this.querySelector(".jump-hint"); if (h) h.style.opacity = "1"; };
+                row.onmouseleave = function () { this.style.background = ""; var h = this.querySelector(".jump-hint"); if (h) h.style.opacity = "0"; };
+                row.onclick = function () {
+                    var docIdx2 = parseInt(row.getAttribute("data-doc-idx"));
+                    var doc2 = docs[docIdx2];
+                    if (!doc2) return;
+                    self._navigateToDocument(doc2.docId, doc2.docTitle);
+                };
+            });
+        });
+    }
+
+    // ========== UUID → root_id 解析（通过 SQL API） ==========
+    // Siyuan v3.7.0 平板端 DOM 中的 data-id / data-node-id 是 UUID 格式，
+    // 需要用 SQL 查询 blocks 表找到对应的 root_id（文档唯一标识）
+    _resolveUuidToRootId(uuid, docTitle, callback) {
+        var self = this;
+        var title = (docTitle || "").trim();
+        if (!title) { callback(null); return; }
+
+        // 直接 SQL 查出文档 root_id（对 type='d' 块，id 即 root_id）
+        var sql = "SELECT id FROM blocks WHERE type = 'd' AND content = '" + title.replace(/'/g, "''") + "' LIMIT 1";
+        console.log("[DocumentDrawing] Looking up doc by title:", title);
+
+        var handleSql = function (data) {
+            try {
+                if (data && data.code === 0 && data.data && data.data.length > 0) {
+                    var rootId = data.data[0].id;
+                    console.log("[DocumentDrawing] SQL resolved:", title, "→", rootId);
+                    callback(rootId);
+                } else {
+                    // SQL 没找到，尝试 listDocTree
+                    console.log("[DocumentDrawing] SQL no match, trying listDocTree...");
+                    self._resolveViaListDocTree(title, callback);
+                }
+            } catch (e) { console.log("[DocumentDrawing] SQL error:", e.message); callback(null); }
+        };
+
+        if (typeof _siyuanFetchPost === "function") {
+            _siyuanFetchPost("/api/query/sql", { stmt: sql }, handleSql);
+        } else {
+            try {
+                var xhr = new XMLHttpRequest();
+                xhr.open("POST", "/api/query/sql", true);
+                xhr.setRequestHeader("Content-Type", "application/json;charset=UTF-8");
+                xhr.timeout = 5000;
+                xhr.onreadystatechange = function () {
+                    if (xhr.readyState !== 4) return;
+                    try { handleSql(JSON.parse(xhr.responseText)); } catch (e) { callback(null); }
+                };
+                xhr.ontimeout = function () { callback(null); };
+                xhr.onerror = function () { callback(null); };
+                xhr.send(JSON.stringify({ stmt: sql }));
+            } catch (e) { callback(null); }
+        }
+    }
+
+    // 备选：通过 listDocTree API 在所有笔记本中搜索文档
+    _resolveViaListDocTree(docTitle, callback) {
+        var self = this;
+        if (typeof _siyuanFetchPost !== "function") { callback(null); return; }
+
+        // 先列出所有笔记本
+        _siyuanFetchPost("/api/notebook/lsNotebooks", {}, function (resp) {
+            try {
+                if (!resp || resp.code !== 0 || !resp.data || !resp.data.notebooks) {
+                    callback(null); return;
+                }
+                var notebooks = resp.data.notebooks;
+                var found = false;
+
+                var tryNext = function (idx) {
+                    if (idx >= notebooks.length || found) {
+                        if (!found) callback(null);
+                        return;
+                    }
+                    var nb = notebooks[idx];
+                    _siyuanFetchPost("/api/filetree/listDocTree", {
+                        path: "/",
+                        notebook: nb.id
+                    }, function (treeResp) {
+                        if (found) return;
+                        if (treeResp && treeResp.code === 0 && treeResp.data) {
+                            // 递归搜索树找匹配标题的文档
+                            var searchTree = function (nodes) {
+                                if (!nodes) return null;
+                                for (var i = 0; i < nodes.length; i++) {
+                                    if (nodes[i].id && /^\d{14}-[a-z0-9]{7}$/.test(nodes[i].id)) {
+                                        // 找到可能的文档 ID，用 getBlockInfo 验证
+                                        return nodes[i].id;
+                                    }
+                                    if (nodes[i].children) {
+                                        var child = searchTree(nodes[i].children);
+                                        if (child) return child;
+                                    }
+                                }
+                                return null;
+                            };
+                            // listDocTree 返回的是树结构，叶节点是文档
+                            // 我们需要匹配标题，但树里只有 id 没有 title
+                            // 所以收集所有文档 ID 然后用 getBlockInfo 验证
+                            var collectIds = function (nodes, ids) {
+                                if (!nodes) return;
+                                for (var i = 0; i < nodes.length; i++) {
+                                    if (nodes[i].id && /^\d{14}-[a-z0-9]{7}$/.test(nodes[i].id)) {
+                                        ids.push(nodes[i].id);
+                                    }
+                                    if (nodes[i].children) collectIds(nodes[i].children, ids);
+                                }
+                            };
+                            var allIds = [];
+                            collectIds(treeResp.data, allIds);
+                            // 对每个 ID 调 getBlockInfo 验证标题
+                            var checkIdx = 0;
+                            var checkNext = function () {
+                                if (checkIdx >= allIds.length || found) {
+                                    if (!found) tryNext(idx + 1);
+                                    return;
+                                }
+                                var did = allIds[checkIdx++];
+                                _siyuanFetchPost("/api/block/getBlockInfo", { id: did }, function (infoResp) {
+                                    if (infoResp && infoResp.code === 0 && infoResp.data) {
+                                        var blockContent = infoResp.data.content || "";
+                                        if (blockContent === docTitle) {
+                                            found = true;
+                                            console.log("[DocumentDrawing] listDocTree matched:", docTitle, "→", did);
+                                            callback(did);
+                                            return;
+                                        }
+                                    }
+                                    checkNext();
+                                });
+                            };
+                            checkNext();
+                        } else {
+                            tryNext(idx + 1);
+                        }
+                    });
+                };
+                tryNext(0);
+            } catch (e) { callback(null); }
+        });
+    }
+
+    // ========== 导航到文档（UUID 自动解析为 root_id） ==========
+    _navigateToDocument(docId, docTitle) {
+        var self = this;
+        // 判断是否为 UUID 格式（需要解析）还是 root_id 格式（可直接使用）
+        var isUuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(docId);
+        var isRootId = /^\d{14}-[a-z0-9]{7}$/.test(docId);
+
+        var doOpen = function (id) {
+            try {
+                if (self.app && self.app.openTab) {
+                    self.app.openTab({ doc: { id: id } });
+                } else if (typeof siyuan !== "undefined" && siyuan.openTab) {
+                    siyuan.openTab({ doc: { id: id } });
+                } else {
+                    siyuan.showMessage("📄 请手动搜索: " + (docTitle || id.slice(0, 12)), 4000);
+                    return;
+                }
+                siyuan.showMessage("📄 已跳转到: " + (docTitle || id.slice(0, 12)), 2000);
+            } catch (e) {
+                siyuan.showMessage("⚠️ 打开文档失败: " + e.message, 3000);
+            }
+        };
+
+        if (isRootId) {
+            doOpen(docId);
+        } else if (isUuid) {
+            // UUID 格式，通过 SQL 解析为 root_id（同时传标题兜底）
+            siyuan.showMessage("🔍 正在定位文档...", 2000);
+            this._resolveUuidToRootId(docId, docTitle, function (rootId) {
+                if (rootId) {
+                    // ★ 解析成功：把 root_id 写回 config，下次直接跳转
+                    self._updateDocIdInConfig(docId, rootId);
+                    doOpen(rootId);
+                } else {
+                    siyuan.showMessage("⚠️ 无法解析文档 ID，请直接打开该文档后重新保存图层", 5000);
+                }
+            });
+        } else if (docId.length <= 8) {
+            siyuan.showMessage("⚠️ 文档 ID 不完整，请重新打开该文档后保存图层", 4000);
+        } else {
+            doOpen(docId);
+        }
+    }
+
+    // 将 config 中的 _docId 从 uuid 更新为 root_id，下次无需 SQL
+    _updateDocIdInConfig(uuid, rootId) {
+        var self = this;
+        if (!this._storage) return;
+        this._storage.updateDocId(uuid, rootId, function (updated) {
+            if (updated) {
+                console.log("[DocumentDrawing] Updated config:", uuid.slice(0, 12) + "…", "→", rootId);
+                // ★ 同步更新内存中的 _docId，防止下次 _autoSave 又用 UUID 覆盖
+                if (self._docManager && self._docManager._docId === uuid) {
+                    self._docManager._docId = rootId;
+                }
+            }
+        });
+    }
+
 }
 
 module.exports = DocumentDrawingPlugin;
