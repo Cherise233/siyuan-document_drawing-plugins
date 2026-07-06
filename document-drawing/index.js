@@ -30,8 +30,9 @@ class DocumentManager {
         this._rootIdResolver = null;  // UUID → root_id 解析函数
         this._resolvingUuid = null;   // 正在解析中的 UUID（防重复）
         this._lastUuid = null;        // 上次解析为 root_id 的 UUID
-        this._lastTitle = null;       // 上次解析时的文档标题（切换文档检测）
-        this._prevDocId = null;       // 切文档前的旧 root_id（传给 _onDocChange）
+        this._lastTitle = null;       // 当前文档标题
+        this._prevDocId = null;       // 切文档前的旧 root_id
+        this._prevDocTitle = null;    // 切文档前的旧标题
         this._resolveTimer = null;    // 延迟解析计时器
         // ★ 延迟启动监听——等 setRootIdResolver 注入后由外部调用 startWatch
     }
@@ -156,8 +157,8 @@ class DocumentManager {
                     if (curTitle && this._lastTitle && curTitle !== this._lastTitle) {
                         console.log("[DocumentManager] title changed, re-resolving:", this._lastTitle, "→", curTitle);
                         this._prevDocId = this._docId;
+                        this._prevDocTitle = this._lastTitle;  // ★ 保存旧标题
                         this._lastTitle = curTitle;
-                        // ★ 立即触发保存旧文档（通过 _onDocChange 模拟）
                         if (this._onDocChange) this._onDocChange(null, this._docId);
                         this._docId = null;
                     } else if (!this._lastTitle) {
@@ -1441,6 +1442,34 @@ class Storage {
         callback(result);
     }
 
+    // ★ 删除整个文档的图层数据（目录 + 所有文件）
+    deleteDocument(docId, docTitle) {
+        if (IS_DESKTOP) {
+            var dir = this._findDocDir(docId, docTitle);
+            try {
+                if (fs.existsSync(dir)) {
+                    var files = fs.readdirSync(dir);
+                    files.forEach(function (f) {
+                        try { fs.unlinkSync(dir + "/" + f); } catch (e) {}
+                    });
+                    fs.rmdirSync(dir);
+                    console.log("[DocumentDrawing] deleted folder:", dir);
+                }
+            } catch (e) { console.warn("[DocumentDrawing] delete folder failed:", e.message); }
+        } else {
+            try {
+                localStorage.removeItem(LS_PREFIX + docId);
+                // 删除关联的图层图片
+                for (var i = localStorage.length - 1; i >= 0; i--) {
+                    var key = localStorage.key(i);
+                    if (key && key.indexOf(LS_IMG_PREFIX + docId) === 0) {
+                        localStorage.removeItem(key);
+                    }
+                }
+            } catch (e) {}
+        }
+    }
+
     // 将 config.json 中的 _docId 从 uuid 更新为 root_id
     updateDocId(uuid, rootId, callback) {
         if (IS_DESKTOP) {
@@ -2038,7 +2067,9 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
                 if (!isSameDoc) {
                     // ★ 真正的文档切换：保存旧文档 + 重置
                     if (oldDocId && self._layerManager._layers.length > 0) {
-                        self._storage.save(oldDocId, self._layerManager.toConfig(), self._layerManager.getLayers());
+                        var oldCfg = self._layerManager.toConfig();
+                        oldCfg._docTitle = self._docManager._prevDocTitle || oldDocId;
+                        self._storage.save(oldDocId, oldCfg, self._layerManager.getLayers());
                         console.log("[DocumentDrawing] saved old document:", oldDocId);
                     }
                     self._layerManager._layers = [];
@@ -3689,9 +3720,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
         var el = dialog.element;
         if (!el) return;
 
-        this._storage.listAllDocuments(function (docs) {
-            var contentEl = el.querySelector("#all-layers-content");
-            if (!contentEl) return;
+        var renderDocs = function (docs, contentEl) {
             if (!docs || docs.length === 0) {
                 contentEl.innerHTML = '<h3 style="margin:0 0 12px 0;font-size:15px;">🗂️ 所有图层总览</h3>' +
                     '<div style="padding:32px;text-align:center;color:#999;">暂无任何文档的绘图数据</div>';
@@ -3716,6 +3745,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
                     '<span style="font-size:14px;">📄</span>' +
                     '<span style="flex:1;font-size:13px;font-weight:600;">' + docTitleEsc + star + '</span>' +
                     '<span style="font-size:11px;color:#999;">' + layerCount + ' 层</span>' +
+                    '<button class="del-doc-btn" data-del-doc-idx="' + docIdx + '" title="删除该文档所有图层" style="border:none;background:none;cursor:pointer;font-size:16px;padding:2px 6px;opacity:0.4;transition:opacity 0.15s;">❌</button>' +
                     '</div>' +
                     '<div class="doc-layers" data-doc-idx="' + docIdx + '" style="display:none;">';
                 if (layerCount === 0) {
@@ -3739,7 +3769,9 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
             // 文档折叠/展开
             var headers = contentEl.querySelectorAll(".doc-header");
             headers.forEach(function (hdr) {
-                hdr.onclick = function () {
+                hdr.onclick = function (ev) {
+                    // 点击删除按钮时不触发展开/折叠
+                    if (ev.target.closest && ev.target.closest(".del-doc-btn")) return;
                     var idx = hdr.getAttribute("data-doc-idx");
                     var layersEl = contentEl.querySelector('[data-doc-idx="' + idx + '"].doc-layers');
                     var toggle = hdr.querySelector(".doc-toggle");
@@ -3748,6 +3780,49 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
                         layersEl.style.display = isOpen ? "none" : "";
                         if (toggle) toggle.style.transform = isOpen ? "" : "rotate(90deg)";
                     }
+                };
+            });
+
+            // 文档删除按钮
+            var delBtns = contentEl.querySelectorAll(".del-doc-btn");
+            delBtns.forEach(function (btn) {
+                btn.onmouseenter = function () { this.style.opacity = "1"; };
+                btn.onmouseleave = function () { this.style.opacity = "0.4"; };
+                btn.onclick = function (ev) {
+                    ev.stopPropagation();
+                    var docIdx3 = parseInt(btn.getAttribute("data-del-doc-idx"));
+                    var doc3 = docs[docIdx3];
+                    if (!doc3) return;
+                    if (!confirm("确定删除「" + (doc3.docTitle || doc3.docId) + "」的所有图层和文件夹？")) return;
+                    if (self._storage && doc3.docId) {
+                        doc3.layers.forEach(function (l) {
+                            self._storage.deleteLayerImage(doc3.docId, l.id);
+                        });
+                        self._storage.deleteDocument(doc3.docId, doc3.docTitle);
+                    }
+                    // ★ 如果删除的是当前文档，同步清空内存中的图层
+                    var curDocId = self._docManager ? self._docManager.getDocumentID() : null;
+                    if (curDocId && curDocId === doc3.docId && self._layerManager) {
+                        self._layerManager._layers = [];
+                        self._layerManager._currentLayerId = null;
+                        self._layerManager._nextId = 1;
+                        if (self._canvasManager) {
+                            self._canvasManager.clearSelection();
+                            self._canvasManager.clearHistory();
+                            Object.values(self._canvasManager._canvases).forEach(function (c) {
+                                if (c.parentNode) c.parentNode.removeChild(c);
+                            });
+                            self._canvasManager._canvases = {};
+                        }
+                        self._removeOverlay();
+                        self._removeToolbar();
+                    }
+                    siyuan.showMessage("✅ 已删除「" + (doc3.docTitle || doc3.docId) + "」", 2000);
+                    // ★ 重新扫描并刷新整个弹窗
+                    self._storage.listAllDocuments(function (newDocs) {
+                        var cEl = el.querySelector("#all-layers-content");
+                        if (cEl) renderDocs(newDocs, cEl);
+                    });
                 };
             });
 
@@ -3763,6 +3838,12 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
                     self._navigateToDocument(doc2.docId, doc2.docTitle);
                 };
             });
+        };
+
+        this._storage.listAllDocuments(function (docs) {
+            var contentEl2 = el.querySelector("#all-layers-content");
+            if (!contentEl2) return;
+            renderDocs(docs, contentEl2);
         });
     }
 
