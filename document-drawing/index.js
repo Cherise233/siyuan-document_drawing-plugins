@@ -157,9 +157,12 @@ class DocumentManager {
                     if (curTitle && this._lastTitle && curTitle !== this._lastTitle) {
                         console.log("[DocumentManager] title changed, re-resolving:", this._lastTitle, "→", curTitle);
                         this._prevDocId = this._docId;
-                        this._prevDocTitle = this._lastTitle;  // ★ 保存旧标题
+                        this._prevDocTitle = this._lastTitle;
                         this._lastTitle = curTitle;
-                        if (this._onDocChange) this._onDocChange(null, this._docId);
+                        // ★ 直接保存旧文档（不通过 _onDocChange 避免 null load）
+                        if (this._onDocChange) {
+                            this._onDocChange("__save_only__", this._docId);
+                        }
                         this._docId = null;
                     } else if (!this._lastTitle) {
                         this._lastTitle = curTitle;
@@ -673,20 +676,20 @@ class CanvasManager {
             if (!canvas) return;
             const oldWidth = canvas.width;
             const oldHeight = canvas.height;
-            if (newWidth === oldWidth && newHeight === oldHeight) return;
+            // ★ 只放大不缩小：缩小会导致超出边界的笔迹永久丢失
+            var targetW = Math.max(oldWidth, newWidth);
+            var targetH = Math.max(oldHeight, newHeight);
+            if (targetW === oldWidth && targetH === oldHeight) return;
 
-            // 保存完整的旧内容
             const tempCanvas = document.createElement("canvas");
             tempCanvas.width = oldWidth;
             tempCanvas.height = oldHeight;
             const tempCtx = tempCanvas.getContext("2d");
             tempCtx.drawImage(canvas, 0, 0);
 
-            // 调整尺寸（这会自动清空 canvas）
-            canvas.width = newWidth;
-            canvas.height = newHeight;
+            canvas.width = targetW;
+            canvas.height = targetH;
 
-            // 恢复旧内容（绘制到左上角）
             const ctx = canvas.getContext("2d");
             ctx.drawImage(tempCanvas, 0, 0);
         });
@@ -874,22 +877,17 @@ class CanvasManager {
                     self._twoFingerTapPossible = false;
                     self._activeTouchCount = 0;
                     self._touchScrolling = false;
-                    if (self.undo()) {
-                        self._notify("↩️ 已撤销");
-                    }
+                    if (self.undo()) { /* 撤销成功，不弹出通知 */ }
                     try { canvas.releasePointerCapture(e.pointerId); } catch (ex) {}
                     return;
                 }
                 if (self._activeTouchCount <= 0) {
                     self._activeTouchCount = 0;
                     self._touchScrolling = false;
-                    // ★ 双指点击撤销（短时间、未移动、两根手指）
                     if (self._twoFingerTapPossible && !self._touchMoved &&
                         Date.now() - self._twoFingerStartTime < 400) {
                         self._twoFingerTapPossible = false;
-                        if (self.undo()) {
-                            self._notify("↩️ 已撤销");
-                        }
+                        if (self.undo()) { /* 撤销成功，不弹出通知 */ }
                         try { canvas.releasePointerCapture(e.pointerId); } catch (ex) {}
                         return;
                     }
@@ -2059,6 +2057,16 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
             console.log("[DocumentDrawing] registering onDocChange callback");
             this._docManager.onDocChange(function (newDocId, oldDocId) {
                 console.log("[DocumentDrawing] document changed from", oldDocId, "to", newDocId);
+                // ★ 仅保存标记：只保存旧文档，不加载（切文档时用）
+                if (newDocId === "__save_only__") {
+                    if (oldDocId && self._layerManager._layers.length > 0) {
+                        var saveCfg = self._layerManager.toConfig();
+                        saveCfg._docTitle = self._docManager._prevDocTitle || oldDocId;
+                        self._storage.save(oldDocId, saveCfg, self._layerManager.getLayers());
+                        console.log("[DocumentDrawing] saved:", oldDocId);
+                    }
+                    return;
+                }
                 // ★ 判断是否为同一文档的 ID 转换（null→root_id 或 UUID→root_id）
                 var isFirstResolve = !oldDocId;
                 var isUuidToRootId = oldDocId && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(oldDocId);
@@ -2097,7 +2105,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
                             self._layerManager.loadFromConfig(config);
                         } else {
                             self._layerManager.loadFromConfig(config);
-                            // ★ 工具栏和画布同步：用户关了就不重建，开着就重建
+                            // ★ 工具栏关了就不弹，但要创建 canvas（切文档时）
                             if (!self._userClosedToolbar) {
                                 self._rebuildOverlay(newDocId);
                             }
@@ -2194,13 +2202,11 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
         if (!this._layerManager) this._initManagers();
         this._syncDocumentLayers();
 
-        // ★ 用户之前关了 → 先完整重建
-        if (!this._toolbarEl || !document.body.contains(this._toolbarEl)) {
+        // ★ 工具栏关了 → 先重建所有已有图层，再加新的
+        var needRebuild = !this._toolbarEl || !document.body.contains(this._toolbarEl);
+        if (needRebuild && this._layerManager.getLayers().length > 0) {
             var docId = this._docManager ? this._docManager.getDocumentID() : null;
-            if (docId && this._layerManager.getLayers().length > 0) {
-                this._rebuildOverlay(docId);
-                return;
-            }
+            if (docId) { this._rebuildOverlay(docId); return; }
         }
 
         const editor = this._docManager ? this._docManager.getDocumentDOM() : null;
@@ -2210,7 +2216,6 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
         const cw = Math.max(rect.width || 800, 400);
         const ch = Math.max(editor.scrollHeight || rect.height || 600, 600);
 
-        // 始终创建新图层
         const layer = this._layerManager.createLayer();
         const canvas = this._canvasManager.createCanvas(layer.id, cw, ch);
         this._layerManager.bindCanvas(layer.id, canvas);
@@ -2250,7 +2255,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
         // 创建新的 overlay 容器
         const container = document.createElement("div");
         container.className = "drawing-overlay-container";
-        container.style.cssText = "position:absolute;top:0;left:0;width:" + width + "px;height:" + height + "px;pointer-events:none;z-index:10;";
+        container.style.cssText = "position:absolute;top:0;left:0;width:" + width + "px;height:" + height + "px;pointer-events:none;z-index:10;overflow:hidden;";
 
         if (correctParent) {
             if (getComputedStyle(correctParent).position === "static") correctParent.style.position = "relative";
@@ -2345,10 +2350,15 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
     }
 
     _rebuildOverlay(docId) {
-        this._userClosedToolbar = false;  // 主动重建时重置标记
+        console.log("[DocumentDrawing] _rebuildOverlay start, docId:", docId, "layers:", this._layerManager.getLayers().length, "currentLayerId:", this._layerManager.getCurrentLayerId());
+        this._userClosedToolbar = false;
         this._removeOverlay();
         const editor = this._docManager ? this._docManager.getDocumentDOM() : null;
-        if (!editor) return;
+        if (!editor) { console.log("[DocumentDrawing] _rebuildOverlay FAILED: no editor"); return; }
+
+        // ★ 同步 currentLayerId
+        this._canvasManager._currentLayerId = this._layerManager.getCurrentLayerId();
+        console.log("[DocumentDrawing] _rebuildOverlay canvas currentLayerId:", this._canvasManager._currentLayerId);
 
         const rect = editor.getBoundingClientRect();
         const cw = Math.max(rect.width || 800, 400);
@@ -2375,6 +2385,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
 
         this._ensureOverlay(editor, cw, ch);
         this._showToolbar();
+        console.log("[DocumentDrawing] _rebuildOverlay done, canvases:", Object.keys(this._canvasManager._canvases).length);
     }
 
     _removeOverlay() {
@@ -2856,11 +2867,17 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
             return;
         }
 
+        // ★ 工具栏关了 → 先重建画布再打开图层管理
+        var needRebuild = !this._toolbarEl || !document.body.contains(this._toolbarEl);
+        if (needRebuild && this._layerManager.getLayers().length > 0) {
+            this._rebuildOverlay(docId);
+        }
+
         const buildListHtml = function (layers, currentId) {
             if (layers.length === 0) return '<div style="padding:16px;color:#999;font-size:13px;">暂无图层，请先添加</div>';
             let html = "";
             layers.forEach(function (l) {
-                const eye = l.visible ? "&#128065;" : "&#128064;";
+                const eye = l.visible ? "👁️" : "➖";
                 const active = l.id === currentId ? "background:#e8f0fe;" : "";
                 const escapedName = (l.name || ("图层 " + l.id)).replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
                 html += '<div style="display:flex;align-items:center;gap:6px;padding:6px 8px;border-radius:6px;cursor:pointer;' + active + '" data-lid="' + l.id + '">' +
@@ -3045,7 +3062,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
             var checked = l.visible && l.canvas ? " checked" : "";
             var disabled = !l.canvas ? " disabled" : "";
             var name = (l.name || ("图层 " + l.id)).replace(/"/g, "&quot;").replace(/</g, "&lt;");
-            var eye = l.visible ? "👁" : "👁‍🗨";
+            var eye = l.visible ? "👁" : "➖";
             layerRows += '<label style="display:flex;align-items:center;gap:6px;padding:3px 0;font-size:13px;cursor:pointer;">' +
                 '<input type="checkbox" class="dd-export-layer" data-lid="' + l.id + '"' + checked + disabled + '>' +
                 '<span style="flex:1;">' + eye + ' ' + name + '</span>' +
@@ -3752,7 +3769,7 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
                     html += '<div style="padding:8px 12px 8px 32px;font-size:12px;color:#999;">（空）</div>';
                 } else {
                     doc.layers.forEach(function (l) {
-                        var eye = l.visible !== false ? '👁️' : '🚫';
+                        var eye = l.visible !== false ? '👁️' : '➖';
                         var layerNameEsc = (l.name || "图层 " + l.id).replace(/"/g, "&quot;").replace(/</g, "&lt;");
                         html += '<div class="layer-row" data-doc-idx="' + docIdx + '" data-layer-id="' + l.id + '" style="display:flex;align-items:center;gap:6px;padding:4px 12px 4px 28px;font-size:12px;cursor:pointer;transition:background 0.1s;color:var(--b3-theme-on-background,#555);">' +
                             '<span style="font-size:12px;opacity:0.7;">' + eye + '</span>' +
@@ -3987,6 +4004,35 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
         var isRootId = /^\d{14}-[a-z0-9]{7}$/.test(docId);
 
         var doOpen = function (id) {
+            // ★ 保存当前文档
+            self._autoSave();
+            // ★ 手动切换：不等 DOM 检测，直接保存旧文档、加载新文档
+            var oldId = self._docManager ? self._docManager.getDocumentID() : null;
+            if (oldId && oldId !== id && self._layerManager) {
+                var oldTitle = self._docManager._lastTitle || "";
+                if (self._layerManager._layers.length > 0 && /^\d{14}-[a-z0-9]{7}$/.test(oldId)) {
+                    var saveCfg = self._layerManager.toConfig();
+                    saveCfg._docTitle = oldTitle || oldId;
+                    self._storage.save(oldId, saveCfg, self._layerManager.getLayers());
+                }
+                self._layerManager._layers = [];
+                self._layerManager._currentLayerId = null;
+                self._layerManager._nextId = 1;
+                if (self._canvasManager) {
+                    self._canvasManager.clearSelection();
+                    self._canvasManager.clearHistory();
+                    Object.values(self._canvasManager._canvases).forEach(function (c) {
+                        if (c.parentNode) c.parentNode.removeChild(c);
+                    });
+                    self._canvasManager._canvases = {};
+                    self._canvasManager._currentLayerId = null;
+                }
+                self._removeOverlay();
+                self._removeToolbar();
+                self._docManager._docId = id;
+                self._docManager._lastTitle = docTitle;
+            }
+            // 打开思源标签页
             try {
                 if (self.app && self.app.openTab) {
                     self.app.openTab({ doc: { id: id } });
@@ -3994,22 +4040,42 @@ class DocumentDrawingPlugin extends siyuan.Plugin {
                     siyuan.openTab({ doc: { id: id } });
                 } else {
                     siyuan.showMessage("📄 请手动搜索: " + (docTitle || id.slice(0, 12)), 4000);
-                    return;
                 }
-                siyuan.showMessage("📄 已跳转到: " + (docTitle || id.slice(0, 12)), 2000);
-            } catch (e) {
-                siyuan.showMessage("⚠️ 打开文档失败: " + e.message, 3000);
+            } catch (e) { /* ignore */ }
+            // ★ 延迟重建画布（等标签页加载完 editor DOM，先加载配置再建画布）
+            if (oldId !== id || !self._overlayContainer) {
+                self._userClosedToolbar = false;
+                // 先等配置加载完（loadFromConfig 会设置 _currentLayerId）
+                self._storage.load(id, function (config) {
+                    if (config && config.layers && config.layers.length > 0) {
+                        self._layerManager.loadFromConfig(config);
+                    }
+                    // 配置就绪后，等 editor DOM 就绪再建画布
+                    var retry = 0;
+                    var doRebuild = function () {
+                        var ed = self._docManager ? self._docManager.getDocumentDOM() : null;
+                        if (ed) {
+                            self._rebuildOverlay(id);
+                            siyuan.showMessage("📄 已跳转到: " + (docTitle || id.slice(0, 12)), 2000);
+                        } else if (retry < 50) {
+                            retry++;
+                            setTimeout(doRebuild, 200);
+                        } else {
+                            console.log("[DocumentDrawing] rebuild timeout, editors on page:",
+                                document.querySelectorAll(".protyle-wysiwyg").length);
+                        }
+                    };
+                    doRebuild();
+                });
             }
         };
 
         if (isRootId) {
             doOpen(docId);
         } else if (isUuid) {
-            // UUID 格式，通过 SQL 解析为 root_id（同时传标题兜底）
             siyuan.showMessage("🔍 正在定位文档...", 2000);
             this._resolveUuidToRootId(docId, docTitle, function (rootId) {
                 if (rootId) {
-                    // ★ 解析成功：把 root_id 写回 config，下次直接跳转
                     self._updateDocIdInConfig(docId, rootId);
                     doOpen(rootId);
                 } else {
